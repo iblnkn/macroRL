@@ -1,4 +1,4 @@
-# macroRL# Project Title: LSTM-Based Macroeconomic Forecasting with PyTorch
+# macroRL: LSTM-Based Macroeconomic Forecasting with PyTorch
 
 This repository contains a toy project for forecasting macroeconomic variables (e.g., CPI-based inflation) using an LSTM in PyTorch. It includes TensorBoard logging for visualization, and fetches data from [FRED](https://fred.stlouisfed.org/) via `pandas_datareader`.
 
