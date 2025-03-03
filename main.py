@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
-main.py - LSTM-based Inflation Forecasting with TensorBoard Logging
--------------------------------------------------------------------
-- Fetch CPI data from FRED (year-over-year inflation).
-- Train an LSTM to predict next month's inflation.
-- Log all training/test metrics (loss, RMSE, MAE) and final prediction plots to TensorBoard.
+A Minimal LSTM Example for Inflation Forecasting in Economics
+-------------------------------------------------------------
+What it does:
+  1) Fetches monthly CPI data from FRED, computes YOY inflation (%).
+  2) Creates sequences of length 'lookback' to predict next-month inflation.
+  3) Normalizes the inflation series (mean=0, std=1).
+  4) Defines and trains a single-layer LSTM in PyTorch for forecasting.
+  5) Plots the predicted vs. actual inflation on both training and test sets.
+
 """
 
-import math
 import numpy as np
 import pandas as pd
 import pandas_datareader.data as web
@@ -15,237 +18,218 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torch.utils.tensorboard import SummaryWriter
+import matplotlib.pyplot as plt
 import datetime
-import matplotlib.pyplot as plt  # Used to create figures for TensorBoard logging
 
-# ------------------------------ Configurable Hyperparameters ------------------------------
-FRED_SERIES = "CPIAUCSL"      # CPI for All Urban Consumers (U.S. city average)
-START_DATE = "1980-01-01"
-END_DATE = "2022-12-01"
-LOOKBACK = 12                 # number of past months for input
-TRAIN_FRAC = 0.8              # fraction of data used for training
-BATCH_SIZE = 16
-EPOCHS = 30
-LR = 1e-3                     # learning rate
-DEVICE = "cpu"                # use "cuda" if you have a GPU
-# -------------------------------------------------------------------------------------------
+# ----------------- Hyperparameters ------------------
+LOOKBACK      = 24      # months of historical data used as input
+BATCH_SIZE    = 32      # mini-batch size
+EPOCHS        = 50      # number of training epochs
+LEARNING_RATE = 1e-3    # learning rate for the optimizer
+HIDDEN_SIZE   = 64      # LSTM hidden dimension
+DROP_PROB     = 0.1     # dropout probability
+TRAIN_FRAC    = 0.8     # fraction of data to use for training
+START_DATE    = "1980-01-01"
+END_DATE      = "2022-12-01"
 
-def fetch_inflation_data(start=START_DATE, end=END_DATE):
+# ------------------- Data Utilities -------------------
+def fetch_cpi_from_fred(fred_api_key=None):
     """
-    Fetch monthly CPI from FRED, compute YoY inflation in %, and return as a pandas Series.
-    If you have FRED access issues or need an API key, see the earlier notes on manual CSV.
+    Fetch CPI data (monthly) from FRED. 
+    If you have an API key, pass it in; otherwise, it usually works without one.
+    Returns a Series of CPI with a monthly DateTime index.
     """
-    df_cpi = web.DataReader(FRED_SERIES, 'fred', start, end)
-    df_cpi.dropna(inplace=True)
-    # Compute year-over-year inflation, i.e., ((CPI[t]/CPI[t-12]) - 1)*100
-    df_cpi["inflation"] = df_cpi[FRED_SERIES].pct_change(periods=12) * 100
-    df_cpi.dropna(inplace=True)
-    return df_cpi["inflation"]
+    series_name = "CPIAUCSL"  # CPI All Urban Consumers
+    if fred_api_key:
+        df = web.DataReader(series_name, "fred", START_DATE, END_DATE, api_key=fred_api_key)
+    else:
+        df = web.DataReader(series_name, "fred", START_DATE, END_DATE)
+    # Ensure monthly frequency (sometimes daily if a key is used)
+    df = df.resample("MS").mean().ffill()
+    return df[series_name]
 
+def compute_yoy_inflation(cpi_series):
+    """
+    Given a monthly CPI series, compute the year-over-year inflation rate (percent).
+    inflation_t = (CPI_t / CPI_{t-12} - 1) * 100.
+    Returns a pandas Series of inflation rates.
+    """
+    inflation = (cpi_series.pct_change(12) * 100).dropna()
+    return inflation
+
+def make_sequences(inflation_series, lookback=12):
+    """
+    Build a 2D numpy array of shape (N, lookback) for the LSTM input (X)
+    and a 1D array (N,) for the next-month inflation (y).
+    
+    For time index t, X_t contains inflation at t-lookback,...,t-1.
+    y_t is inflation at time t.
+    """
+    values = inflation_series.values  # 1D array of shape (length,)
+    sequences = []
+    targets = []
+    for i in range(len(values) - lookback):
+        X_seq = values[i : i + lookback]
+        y_val = values[i + lookback]
+        sequences.append(X_seq)
+        targets.append(y_val)
+    return np.array(sequences), np.array(targets)
+
+# ----------------- PyTorch Dataset & Model -----------------
 class InflationDataset(Dataset):
     """
-    Creates (X, y) sequences from a 1D inflation array:
-      - X: the last 'lookback' observations
-      - y: the next observation
+    Simple Dataset: each item is (X, y)
+      X = shape (lookback,)  (we'll expand dims later for LSTM)
+      y = scalar inflation
     """
-    def __init__(self, data_array, lookback=LOOKBACK):
+    def __init__(self, X, y):
         super().__init__()
-        self.data = data_array
-        self.lookback = lookback
+        self.X = X
+        self.y = y
 
     def __len__(self):
-        return len(self.data) - self.lookback
+        return len(self.X)
 
     def __getitem__(self, idx):
-        X_seq = self.data[idx : idx + self.lookback]
-        y_val = self.data[idx + self.lookback]
-        return torch.tensor(X_seq, dtype=torch.float32), torch.tensor(y_val, dtype=torch.float32)
+        # LSTM expects shape (batch, sequence_length, input_dim).
+        # Here input_dim=1 since we only have inflation as a feature.
+        X_seq = torch.tensor(self.X[idx], dtype=torch.float32).unsqueeze(-1)
+        y_val = torch.tensor(self.y[idx], dtype=torch.float32)
+        return X_seq, y_val
 
-class LSTMForecastModel(nn.Module):
-    """
-    LSTM regressor for time-series forecasting.
-    We interpret (batch_size, lookback) => LSTM with a single feature dimension.
-    """
-    def __init__(self, hidden_size=32, num_layers=1):
+class SimpleLSTM(nn.Module):
+    def __init__(self, hidden_size=32, dropout=0.0):
+        """
+        A single-layer LSTM that outputs 1 value (inflation).
+        """
         super().__init__()
         self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        self.lstm = nn.LSTM(input_size=1, hidden_size=hidden_size,
-                            num_layers=num_layers, batch_first=True)
+        # input_size=1 because we have only 1 feature (inflation)
+        self.lstm = nn.LSTM(input_size=1, hidden_size=hidden_size, batch_first=True)
+        self.dropout = nn.Dropout(dropout)
         self.fc = nn.Linear(hidden_size, 1)
 
     def forward(self, x):
-        # x: (batch, lookback)
-        x = x.unsqueeze(-1)  # => (batch, lookback, 1)
-        # Initialize hidden/cell states
-        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size, device=x.device)
-        c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size, device=x.device)
-        out, _ = self.lstm(x, (h0, c0))  # => (batch, lookback, hidden_size)
-        out = out[:, -1, :]             # last timestep => (batch, hidden_size)
-        out = self.fc(out)              # => (batch, 1)
-        return out.squeeze(-1)          # => (batch,)
+        """
+        x: shape (batch_size, lookback, 1)
+        """
+        # h_0 and c_0 default to zeros if not provided
+        out, _ = self.lstm(x)      # out => (batch_size, lookback, hidden_size)
+        out = out[:, -1, :]        # get the last time-step
+        out = self.dropout(out)
+        out = self.fc(out)         # => (batch_size, 1)
+        return out.squeeze(-1)     # => (batch_size,)
 
-def rmse_func(y_pred, y_true):
-    return math.sqrt(np.mean((y_pred - y_true) ** 2))
-
-def mae_func(y_pred, y_true):
-    return np.mean(np.abs(y_pred - y_true))
-
-def evaluate(model, loader, device="cpu"):
-    """
-    Returns predictions and ground-truth for the entire dataset in loader.
-    We'll compute metrics externally.
-    """
-    model.eval()
-    preds = []
-    trues = []
-    with torch.no_grad():
-        for X_batch, y_batch in loader:
-            X_batch = X_batch.to(device)
-            out = model(X_batch)
-            preds.append(out.cpu().numpy())
-            trues.append(y_batch.numpy())
-    preds = np.concatenate(preds)
-    trues = np.concatenate(trues)
-    return preds, trues
-
-def train_one_epoch(model, loader, optimizer, criterion, device="cpu"):
+# ----------------- Training & Plotting -----------------
+def train_model(model, train_loader, optimizer, criterion):
     model.train()
-    running_loss = 0.0
-    n_samples = 0
-    for X_batch, y_batch in loader:
-        X_batch = X_batch.to(device)
-        y_batch = y_batch.to(device)
+    total_loss = 0.0
+    for X_batch, y_batch in train_loader:
         optimizer.zero_grad()
-
-        pred = model(X_batch)
-        loss = criterion(pred, y_batch)
+        preds = model(X_batch)
+        loss = criterion(preds, y_batch)
         loss.backward()
         optimizer.step()
+        total_loss += loss.item() * X_batch.size(0)
+    return total_loss / len(train_loader.dataset)
 
-        running_loss += loss.item() * X_batch.size(0)
-        n_samples    += X_batch.size(0)
-
-    return running_loss / n_samples
+def evaluate_model(model, loader):
+    model.eval()
+    all_preds = []
+    all_targets = []
+    with torch.no_grad():
+        for X_batch, y_batch in loader:
+            preds = model(X_batch)
+            all_preds.append(preds.numpy())
+            all_targets.append(y_batch.numpy())
+    return np.concatenate(all_preds), np.concatenate(all_targets)
 
 def main():
-    # ------------------------------ 1. Set up TensorBoard writer ---------------------------
-    # We append a timestamp so each run has a unique log directory under 'runs/'
-    current_time = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    log_dir = f"runs/inflation-{current_time}"
-    writer = SummaryWriter(log_dir=log_dir)
-
-    # ------------------------------ 2. Fetch & prep data -----------------------------------
-    inflation_ts = fetch_inflation_data()
-    data_vals = inflation_ts.values
-    n_train = int(len(data_vals) * TRAIN_FRAC)
-
-    train_data = data_vals[:n_train]
-    test_data  = data_vals[n_train:]
-
-    train_dataset = InflationDataset(train_data, lookback=LOOKBACK)
-    test_dataset  = InflationDataset(test_data,  lookback=LOOKBACK)
-
+    # 1) Fetch CPI data and compute inflation
+    cpi = fetch_cpi_from_fred(fred_api_key=None)
+    inflation = compute_yoy_inflation(cpi)
+    
+    # 2) Split data into train/test
+    n_total = len(inflation)
+    n_train = int(n_total * TRAIN_FRAC)
+    train_inflation = inflation.iloc[:n_train]
+    test_inflation  = inflation.iloc[n_train:]
+    
+    # 3) Normalize each split (basic standardization)
+    mean_train = train_inflation.mean()
+    std_train  = train_inflation.std()
+    train_scaled = (train_inflation - mean_train) / std_train
+    test_scaled  = (test_inflation - mean_train) / std_train
+    
+    # 4) Build sequences for model input
+    X_train, y_train = make_sequences(train_scaled, lookback=LOOKBACK)
+    X_test, y_test   = make_sequences(test_scaled,  lookback=LOOKBACK)
+    
+    # Note: we lose 'LOOKBACK' points at the start of each set.
+    train_dates = train_inflation.index[LOOKBACK:]
+    test_dates  = test_inflation.index[LOOKBACK:]
+    
+    # 5) Dataloaders
+    train_dataset = InflationDataset(X_train, y_train)
+    test_dataset  = InflationDataset(X_test,  y_test)
+    
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
     test_loader  = DataLoader(test_dataset,  batch_size=BATCH_SIZE, shuffle=False)
-
-    # For final plotting, keep track of the date indices
-    train_dates = inflation_ts.index[LOOKBACK : n_train]
-    test_dates  = inflation_ts.index[n_train + LOOKBACK : ]
-
-    # ------------------------------ 3. Define model & training objects ----------------------
-    model = LSTMForecastModel(hidden_size=32, num_layers=1).to(DEVICE)
-    optimizer = optim.Adam(model.parameters(), lr=LR)
+    
+    # 6) Define model, optimizer, loss
+    model = SimpleLSTM(hidden_size=HIDDEN_SIZE, dropout=DROP_PROB)
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     criterion = nn.MSELoss()
-
-    # ------------------------------ 4. Training Loop with TensorBoard -----------------------
+    
+    # 7) Training loop
     for epoch in range(1, EPOCHS+1):
-        # Train for one epoch
-        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, DEVICE)
-
-        # Evaluate on training set
-        train_preds, train_trues = evaluate(model, train_loader, DEVICE)
-        train_mse = np.mean((train_preds - train_trues)**2)
-        train_rmse = rmse_func(train_preds, train_trues)
-        train_mae  = mae_func(train_preds, train_trues)
-
+        train_loss = train_model(model, train_loader, optimizer, criterion)
         # Evaluate on test set
-        test_preds, test_trues = evaluate(model, test_loader, DEVICE)
-        test_mse = np.mean((test_preds - test_trues)**2)
-        test_rmse = rmse_func(test_preds, test_trues)
-        test_mae  = mae_func(test_preds, test_trues)
-
-        # Log metrics to TensorBoard
-        # You can group them with "scalars" in the UI:
-        writer.add_scalar("MSE/Train", train_mse, epoch)
-        writer.add_scalar("MSE/Test",  test_mse,  epoch)
-        writer.add_scalar("RMSE/Train",train_rmse, epoch)
-        writer.add_scalar("RMSE/Test", test_rmse,  epoch)
-        writer.add_scalar("MAE/Train", train_mae,  epoch)
-        writer.add_scalar("MAE/Test",  test_mae,   epoch)
-        writer.add_scalar("Loss/Train", train_loss, epoch)
-
-        # Optionally print to console if desired:
+        test_preds, test_targets = evaluate_model(model, test_loader)
+        test_loss = np.mean((test_preds - test_targets)**2)
+        
         print(f"Epoch {epoch:2d}/{EPOCHS} | "
-              f"Train MSE: {train_mse:.4f}, RMSE: {train_rmse:.4f}, MAE: {train_mae:.4f} | "
-              f"Test MSE: {test_mse:.4f}, RMSE: {test_rmse:.4f}, MAE: {test_mae:.4f}")
+              f"Train MSE: {train_loss:.4f} | Test MSE: {test_loss:.4f}")
+    
+    # 8) Predictions & Plot
+    # Predict on entire train and test sets
+    train_preds, train_targs = evaluate_model(model, train_loader)
+    test_preds,  test_targs  = evaluate_model(model, test_loader)
+    
+    # Invert the normalization
+    train_preds_real = train_preds * std_train + mean_train
+    train_targs_real = train_targs * std_train + mean_train
+    test_preds_real  = test_preds  * std_train + mean_train
+    test_targs_real  = test_targs  * std_train + mean_train
+    
+    # Convert to DataFrame for easy plotting
+    df_train_plot = pd.DataFrame({
+        "Date": train_dates[len(train_preds_real)*-1:],  # align last part
+        "Predicted": train_preds_real,
+        "Actual": train_targs_real
+    }).set_index("Date")
+    
+    df_test_plot = pd.DataFrame({
+        "Date": test_dates[len(test_preds_real)*-1:],  # align last part
+        "Predicted": test_preds_real,
+        "Actual": test_targs_real
+    }).set_index("Date")
+    
+    plt.figure(figsize=(10, 5))
+    plt.plot(df_train_plot.index, df_train_plot["Actual"], label="Train Actual", color="blue")
+    plt.plot(df_train_plot.index, df_train_plot["Predicted"], label="Train Predicted", color="red", alpha=0.7)
+    plt.title("LSTM Inflation Forecast - Training Set")
+    plt.ylabel("Inflation (YOY %)")
+    plt.legend()
+    plt.show()
 
-    # ------------------------------ 5. Final Predictions & Plotting to TensorBoard --------------
-    # We'll do in-sample (train dataset) & out-of-sample (test dataset) predictions in date order.
-
-    def get_predictions_in_order(model, dataset):
-        """
-        Get predictions in the original sequential order for the entire dataset
-        (use batch_size=1 with no shuffle).
-        """
-        model.eval()
-        preds_list = []
-        trues_list = []
-        loader = DataLoader(dataset, batch_size=1, shuffle=False)
-        with torch.no_grad():
-            for X_seq, y_val in loader:
-                X_seq = X_seq.to(DEVICE)
-                out = model(X_seq)
-                preds_list.append(out.item())
-                trues_list.append(y_val.item())
-        return np.array(preds_list), np.array(trues_list)
-
-    train_preds_seq, train_true_seq = get_predictions_in_order(model, train_dataset)
-    test_preds_seq,  test_true_seq  = get_predictions_in_order(model, test_dataset)
-
-    # Let's log final in-sample (train) predictions vs actual as a figure
-    fig_train, ax_train = plt.subplots()
-    ax_train.plot(train_dates, train_true_seq, label="Train Actual", linestyle="--")
-    ax_train.plot(train_dates, train_preds_seq, label="Train Predicted")
-    ax_train.set_title("In-Sample (Training) Predictions vs Actual")
-    ax_train.set_xlabel("Date")
-    ax_train.set_ylabel("Inflation (%)")
-    ax_train.legend()
-    writer.add_figure("In-Sample_Predictions", fig_train, global_step=EPOCHS)
-    plt.close(fig_train)
-
-    # Log final out-of-sample (test) predictions
-    fig_test, ax_test = plt.subplots()
-    ax_test.plot(test_dates, test_true_seq, label="Test Actual", linestyle="--")
-    ax_test.plot(test_dates, test_preds_seq, label="Test Predicted")
-    ax_test.set_title("Out-of-Sample (Test) Predictions vs Actual")
-    ax_test.set_xlabel("Date")
-    ax_test.set_ylabel("Inflation (%)")
-    ax_test.legend()
-    writer.add_figure("Out-of-Sample_Predictions", fig_test, global_step=EPOCHS)
-    plt.close(fig_test)
-
-    # You can log final metrics once more if you like:
-    final_train_rmse = rmse_func(train_preds_seq, train_true_seq)
-    final_test_rmse  = rmse_func(test_preds_seq,  test_true_seq)
-    writer.add_scalar("Final_Metrics/Train_RMSE", final_train_rmse)
-    writer.add_scalar("Final_Metrics/Test_RMSE",  final_test_rmse)
-
-    print(f"\nFinal In-Sample (Train) RMSE: {final_train_rmse:.4f}")
-    print(f"Final Out-of-Sample (Test) RMSE: {final_test_rmse:.4f}")
-
-    # Flush & close the TensorBoard writer
+    plt.figure(figsize=(10, 5))
+    plt.plot(df_test_plot.index, df_test_plot["Actual"], label="Test Actual", color="blue")
+    plt.plot(df_test_plot.index, df_test_plot["Predicted"], label="Test Predicted", color="red", alpha=0.7)
+    plt.title("LSTM Inflation Forecast - Test Set")
+    plt.ylabel("Inflation (YOY %)")
+    plt.legend()
+    plt.show()
 
 if __name__ == "__main__":
     main()
